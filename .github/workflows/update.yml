@@ -1,0 +1,65 @@
+name: Cập nhật Shopee Flash Sale
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # GitHub dùng UTC. Chạy mỗi 2 tiếng.
+    - cron: '17 */2 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: shopee-flash-sale
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Lấy mã nguồn
+        uses: actions/checkout@v4
+
+      - name: Cài Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Cài thư viện
+        run: npm install
+
+      - name: Cài Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Quét Shopee Flash Sale
+        run: npm run scrape
+        env:
+          MAX_PRODUCTS: '60'
+          CASHBACK_BASE: 'https://hoantien360.com/?url_hoan_tien='
+
+      - name: Lưu file products.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add products.json debug-responses.json
+          if git diff --cached --quiet; then
+            echo "Không có dữ liệu thay đổi."
+          else
+            git commit -m "Cập nhật Flash Sale Shopee"
+            git push
+          fi
+
+      - name: Tải file chẩn đoán
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shopee-debug
+          path: |
+            debug-shopee.png
+            debug-responses.json
+          if-no-files-found: ignore
+          retention-days: 3
