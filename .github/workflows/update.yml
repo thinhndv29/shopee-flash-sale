@@ -4,8 +4,7 @@ on:
   workflow_dispatch:
 
   schedule:
-    # GitHub dùng UTC. Chạy mỗi 2 tiếng.
-    - cron: '17 */2 * * *'
+    - cron: "17 */2 * * *"
 
 permissions:
   contents: write
@@ -23,10 +22,10 @@ jobs:
       - name: Lấy mã nguồn
         uses: actions/checkout@v4
 
-     - name: Cài Node.js
-  uses: actions/setup-node@v4
-  with:
-    node-version: '20'
+      - name: Cài Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       - name: Cài thư viện
         run: npm install
@@ -37,8 +36,8 @@ jobs:
       - name: Quét Shopee Flash Sale
         run: npm run scrape
         env:
-          MAX_PRODUCTS: '60'
-          CASHBACK_BASE: 'https://hoantien360.com/?url_hoan_tien='
+          MAX_PRODUCTS: "60"
+          CASHBACK_BASE: "https://hoantien360.com/?url_hoan_tien="
 
       - name: Lưu file products.json
         run: |
