@@ -1,44 +1,77 @@
 import { chromium } from 'playwright';
 import fs from 'node:fs/promises';
 
-const PAGE_URL = 'https://shopee.vn/';
+const SHOPEE_URL = 'https://shopee.vn/';
 const OUTPUT_FILE = 'products.json';
-const DEBUG_RESPONSES_FILE = 'debug-responses.json';
-const DEBUG_SCREENSHOT_FILE = 'debug-shopee.png';
+const DEBUG_FILE = 'debug-responses.json';
+const RAW_DAILY_FILE = 'daily_discover.json';
+const RAW_FLASH_FILE = 'flash_sale.json';
 
 const MAX_PRODUCTS = Number(process.env.MAX_PRODUCTS || 60);
+const RESPONSE_WAIT_MS = Number(process.env.RESPONSE_WAIT_MS || 25000);
+
 const CASHBACK_BASE =
   process.env.CASHBACK_BASE ||
   'https://hoantien360.com/?url_hoan_tien=';
 
-const products = new Map();
+const collectedProducts = new Map();
 const debugResponses = [];
+
+let dailyDiscoverSaved = false;
+let flashSaleSaved = false;
 
 function first(...values) {
   return values.find(
-    (value) => value !== undefined && value !== null && value !== ''
+    (value) =>
+      value !== undefined &&
+      value !== null &&
+      value !== ''
   );
 }
 
-function numberValue(value) {
-  if (value === undefined || value === null || value === '') return 0;
-
-  if (Array.isArray(value)) {
-    return numberValue(value[0]);
+function toNumber(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ''
+  ) {
+    return 0;
   }
 
-  const number = Number(String(value).replace(/[^\d.-]/g, ''));
+  if (Array.isArray(value)) {
+    return toNumber(value[0]);
+  }
+
+  if (typeof value === 'object') {
+    return toNumber(
+      first(
+        value.value,
+        value.amount,
+        value.price,
+        value.min
+      )
+    );
+  }
+
+  const normalized = String(value)
+    .replace(/[^\d.-]/g, '')
+    .trim();
+
+  const number = Number(normalized);
 
   return Number.isFinite(number) ? number : 0;
 }
 
-function normalizePrice(value) {
-  let number = numberValue(value);
+function normalizeShopeePrice(value) {
+  let number = toNumber(value);
 
   if (!number) return 0;
 
-  // API Shopee thường lưu giá x100000.
-  if (number >= 100000) {
+  /*
+   * Shopee API thường trả giá theo đơn vị x100000.
+   * Ví dụ: 12900000000 => 129000đ.
+   */
+  if (number >= 10000000) {
     number /= 100000;
   }
 
@@ -52,8 +85,9 @@ function normalizeImage(value) {
     value = first(
       value.url,
       value.image_url,
+      value.image,
       value.image_id,
-      value.image
+      value.thumbnail
     );
   }
 
@@ -71,65 +105,113 @@ function normalizeImage(value) {
   );
 }
 
-function walk(value, callback, depth = 0) {
-  if (depth > 40 || value === null || value === undefined) return;
-
-  callback(value);
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      walk(item, callback, depth + 1);
-    }
-
-    return;
-  }
-
-  if (typeof value === 'object') {
-    for (const child of Object.values(value)) {
-      walk(child, callback, depth + 1);
-    }
-  }
+function createProductUrl(shopId, itemId) {
+  return `https://shopee.vn/product/${shopId}/${itemId}`;
 }
 
-function scoreProduct(item) {
+function extractRatingCount(node) {
+  const direct = toNumber(
+    first(
+      node.rating_count,
+      node.review_count,
+      node.cmt_count,
+      node.comment_count
+    )
+  );
+
+  if (direct) return direct;
+
+  const itemRating = first(
+    node.item_rating,
+    node.rating,
+    node.rating_info
+  );
+
+  if (itemRating && typeof itemRating === 'object') {
+    return toNumber(
+      first(
+        itemRating.rating_count,
+        itemRating.review_count,
+        itemRating.rating_star,
+        itemRating.count
+      )
+    );
+  }
+
+  return 0;
+}
+
+function calculateDiscount(originalPrice, salePrice, rawDiscount) {
+  const discount = toNumber(rawDiscount);
+
+  if (discount > 0 && discount <= 100) {
+    return Math.round(discount);
+  }
+
+  if (
+    originalPrice > 0 &&
+    salePrice > 0 &&
+    originalPrice > salePrice
+  ) {
+    return Math.round(
+      ((originalPrice - salePrice) / originalPrice) * 100
+    );
+  }
+
+  return 0;
+}
+
+function productScore(product) {
   return [
-    item.sale_price,
-    item.original_price,
-    item.discount,
-    item.sold,
-    item.reviews
+    product.sale_price,
+    product.original_price,
+    product.discount,
+    product.sold,
+    product.reviews,
+    product.rating
   ].filter(Boolean).length;
 }
 
-function addCandidate(node) {
-  if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+function addProductCandidate(node, source) {
+  if (
+    !node ||
+    typeof node !== 'object' ||
+    Array.isArray(node)
+  ) {
+    return;
+  }
 
-  const itemId = numberValue(
+  const itemId = toNumber(
     first(
       node.itemid,
       node.item_id,
       node.itemId,
-      node.product_id
+      node.product_id,
+      node.productId
     )
   );
 
-  const shopId = numberValue(
+  const shopId = toNumber(
     first(
       node.shopid,
       node.shop_id,
       node.shopId,
-      node.seller_id
+      node.seller_id,
+      node.sellerId
     )
   );
 
   const name = String(
     first(
       node.name,
-      node.title,
       node.item_name,
-      node.product_name
+      node.title,
+      node.product_name,
+      node.productName
     ) || ''
-  ).trim();
+  )
+    .replace(/\s+/g, ' ')
+    .trim();
 
   const image = normalizeImage(
     first(
@@ -138,179 +220,154 @@ function addCandidate(node) {
       node.imageUrl,
       node.thumbnail,
       node.cover,
+      node.cover_image,
       node.image_info
     )
   );
 
-  if (!itemId || !shopId || !name || !image) return;
+  if (!itemId || !shopId || !name || !image) {
+    return;
+  }
 
-  const productUrl =
-    `https://shopee.vn/product/${shopId}/${itemId}`;
-
-  const salePrice = normalizePrice(
+  const salePrice = normalizeShopeePrice(
     first(
       node.flash_sale_price,
-      node.promo_price,
       node.price,
       node.price_min,
       node.current_price,
-      node.sale_price
+      node.sale_price,
+      node.promo_price,
+      node.price_info?.current_price
     )
   );
 
-  const originalPrice = normalizePrice(
+  const originalPrice = normalizeShopeePrice(
     first(
       node.price_before_discount,
       node.price_min_before_discount,
       node.original_price,
-      node.price_original
+      node.price_original,
+      node.price_info?.original_price
     )
   );
 
-  const discountNumber = numberValue(
+  const discountValue = calculateDiscount(
+    originalPrice,
+    salePrice,
     first(
       node.raw_discount,
       node.show_discount,
       node.discount,
-      node.discount_percent
+      node.discount_percent,
+      node.discount_percentage
     )
   );
 
-  const sold = numberValue(
+  const sold = toNumber(
     first(
       node.historical_sold,
       node.sold,
       node.sold_count,
-      node.items_sold
+      node.items_sold,
+      node.global_sold_count
     )
   );
 
-  let reviews = numberValue(
+  const reviews = extractRatingCount(node);
+
+  const rating = toNumber(
     first(
-      node.rating_count,
-      node.review_count,
-      node.cmt_count
+      node.rating_star,
+      node.rating,
+      node.item_rating?.rating_star,
+      node.rating_info?.rating_star
     )
   );
 
-  if (!reviews && node.item_rating) {
-    reviews = numberValue(
-      first(
-        node.item_rating.rating_count,
-        node.item_rating.review_count
-      )
-    );
-  }
+  const productUrl = createProductUrl(shopId, itemId);
 
   const product = {
     position: 0,
+    item_id: itemId,
+    shop_id: shopId,
     name,
     original_price: originalPrice || '',
     sale_price: salePrice || '',
-    discount: discountNumber
-      ? `${Math.round(discountNumber)}%`
+    discount: discountValue
+      ? `${discountValue}%`
       : '',
     sold: sold || '',
     reviews: reviews || '',
+    rating: rating || '',
     image,
     product_url: productUrl,
     cashback_url:
       CASHBACK_BASE + encodeURIComponent(productUrl),
-    source: 'shopee_homepage',
+    source,
     updated_at: new Date().toISOString()
   };
 
-  const existing = products.get(productUrl);
+  const current = collectedProducts.get(productUrl);
 
-  if (!existing || scoreProduct(product) > scoreProduct(existing)) {
-    products.set(productUrl, product);
+  if (
+    !current ||
+    productScore(product) > productScore(current)
+  ) {
+    collectedProducts.set(productUrl, product);
   }
 }
 
-async function readOldProducts() {
-  try {
-    const content = await fs.readFile(OUTPUT_FILE, 'utf8');
-    const parsed = JSON.parse(content);
-
-    return Array.isArray(parsed.products)
-      ? parsed.products
-      : [];
-  } catch {
-    return [];
+function walkJson(value, source, depth = 0) {
+  if (
+    value === null ||
+    value === undefined ||
+    depth > 50
+  ) {
+    return;
   }
-}
 
-async function collectDomProducts(page) {
-  const domProducts = await page.evaluate(() => {
-    const results = [];
-    const seen = new Set();
-
-    const anchors = [
-      ...document.querySelectorAll('a[href]')
-    ];
-
-    for (const anchor of anchors) {
-      const href = anchor.href || '';
-
-      const match = href.match(
-        /(?:\/product\/(\d+)\/(\d+)|-i\.(\d+)\.(\d+))/
-      );
-
-      if (!match) continue;
-
-      const shopId = match[1] || match[3];
-      const itemId = match[2] || match[4];
-      const key = `${shopId}:${itemId}`;
-
-      if (seen.has(key)) continue;
-
-      const image = anchor.querySelector('img');
-
-      const textCandidates = [
-        image?.alt,
-        anchor.getAttribute('aria-label'),
-        anchor.getAttribute('title'),
-        anchor.textContent
-      ]
-        .filter(Boolean)
-        .map((value) =>
-          String(value).replace(/\s+/g, ' ').trim()
-        )
-        .filter(Boolean);
-
-      const name =
-        textCandidates.sort(
-          (a, b) => b.length - a.length
-        )[0] || '';
-
-      const imageUrl =
-        image?.src ||
-        image?.getAttribute('data-src') ||
-        image?.getAttribute('srcset')?.split(' ')[0] ||
-        '';
-
-      if (!shopId || !itemId || !name || !imageUrl) continue;
-
-      seen.add(key);
-
-      results.push({
-        itemid: Number(itemId),
-        shopid: Number(shopId),
-        name: name.slice(0, 300),
-        image_url: imageUrl
-      });
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      walkJson(item, source, depth + 1);
     }
 
-    return results;
-  });
+    return;
+  }
 
-  domProducts.forEach(addCandidate);
+  if (typeof value === 'object') {
+    addProductCandidate(value, source);
 
-  return domProducts.length;
+    for (const child of Object.values(value)) {
+      walkJson(child, source, depth + 1);
+    }
+  }
+}
+
+async function saveJson(file, data) {
+  await fs.writeFile(
+    file,
+    JSON.stringify(data, null, 2),
+    'utf8'
+  );
+}
+
+async function loadOldProducts() {
+  try {
+    const raw = await fs.readFile(OUTPUT_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+
+    if (Array.isArray(parsed.products)) {
+      return parsed.products;
+    }
+  } catch {
+    // Chưa có file cũ hoặc file cũ không hợp lệ.
+  }
+
+  return [];
 }
 
 async function main() {
-  const oldProducts = await readOldProducts();
+  const oldProducts = await loadOldProducts();
 
   const browser = await chromium.launch({
     headless: true,
@@ -326,7 +383,7 @@ async function main() {
     timezoneId: 'Asia/Ho_Chi_Minh',
     viewport: {
       width: 1440,
-      height: 1400
+      height: 1200
     },
     userAgent:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
@@ -349,16 +406,25 @@ async function main() {
   page.on('response', async (response) => {
     const url = response.url();
 
-    if (!/shopee\.vn/i.test(url)) return;
+    if (!url.includes('shopee.vn/api/')) {
+      return;
+    }
 
     const contentType =
       response.headers()['content-type'] || '';
 
-    if (!contentType.includes('application/json')) return;
+    if (!contentType.includes('application/json')) {
+      return;
+    }
 
-    if (
-      !/(recommend|homepage|mall|item|search|flash_sale|daily_discover)/i.test(url)
-    ) {
+    const interesting =
+      url.includes('/homepage/get_daily_discover') ||
+      url.includes('/recommend/recommend') ||
+      url.includes('/flash_sale/flash_sale_get_items') ||
+      url.includes('/homepage/campaign_modules') ||
+      url.includes('/homepage/mall_shops');
+
+    if (!interesting) {
       return;
     }
 
@@ -367,99 +433,103 @@ async function main() {
 
       debugResponses.push({
         status: response.status(),
-        url
+        url,
+        captured_at: new Date().toISOString()
       });
 
-      walk(json, addCandidate);
-    } catch {
-      // Bỏ qua response không đọc được.
+      let source = 'shopee_homepage_api';
+
+      if (url.includes('/homepage/get_daily_discover')) {
+        source = 'daily_discover';
+
+        if (!dailyDiscoverSaved) {
+          dailyDiscoverSaved = true;
+          await saveJson(RAW_DAILY_FILE, json);
+        }
+      }
+
+      if (url.includes('/flash_sale/flash_sale_get_items')) {
+        source = 'flash_sale';
+
+        if (!flashSaleSaved) {
+          flashSaleSaved = true;
+          await saveJson(RAW_FLASH_FILE, json);
+        }
+      }
+
+      if (url.includes('/recommend/recommend')) {
+        source = 'top_products_homepage';
+      }
+
+      walkJson(json, source);
+
+      console.log(
+        `Đã bắt ${source}: hiện có ${collectedProducts.size} sản phẩm`
+      );
+    } catch (error) {
+      console.warn(
+        `Không đọc được JSON từ ${url}: ${error.message}`
+      );
     }
   });
 
   try {
-    const response = await page.goto(PAGE_URL, {
+    const navigation = await page.goto(SHOPEE_URL, {
       waitUntil: 'domcontentloaded',
       timeout: 60000
     });
 
     console.log(
-      `Trang chủ trả HTTP ${response?.status() || 'không rõ'}`
+      `Trang chủ trả HTTP ${navigation?.status() || 'không rõ'}`
     );
 
-    await page.waitForTimeout(8000);
+    /*
+     * Chờ API trang chủ tự chạy.
+     * Không cần đăng nhập, không cần scrape giao diện.
+     */
+    const startedAt = Date.now();
 
-    // Đóng popup nếu có.
-    const closeSelectors = [
-      'button[aria-label="Close"]',
-      'button[aria-label="Đóng"]',
-      '[class*="close"]',
-      'svg[data-testid="close"]'
-    ];
-
-    for (const selector of closeSelectors) {
-      try {
-        const element = page.locator(selector).first();
-
-        if (await element.isVisible({ timeout: 800 })) {
-          await element.click({ timeout: 1500 });
-          break;
-        }
-      } catch {
-        // Không có popup.
-      }
-    }
-
-    await collectDomProducts(page);
-
-    // Cuộn trang chủ nhiều lần để kích hoạt lazy-load.
-    for (let i = 0; i < 18; i += 1) {
-      await page.mouse.wheel(0, 1000);
-      await page.waitForTimeout(1100);
-
-      const count = await collectDomProducts(page);
+    while (
+      Date.now() - startedAt < RESPONSE_WAIT_MS &&
+      collectedProducts.size < MAX_PRODUCTS
+    ) {
+      await page.waitForTimeout(1000);
 
       console.log(
-        `Lần cuộn ${i + 1}: DOM thấy ${count} link sản phẩm, ` +
-        `đã gom ${products.size} sản phẩm.`
+        `Đang chờ API: ${collectedProducts.size}/${MAX_PRODUCTS} sản phẩm`
       );
-
-      if (products.size >= MAX_PRODUCTS) {
-        break;
-      }
     }
-
-    await page.screenshot({
-      path: DEBUG_SCREENSHOT_FILE,
-      fullPage: false
-    });
   } finally {
+    await saveJson(DEBUG_FILE, debugResponses);
     await browser.close();
   }
 
-  const finalProducts = [...products.values()]
-    .filter((product) => product.name && product.image)
+  const products = [...collectedProducts.values()]
+    .sort((a, b) => {
+      const soldDifference =
+        toNumber(b.sold) - toNumber(a.sold);
+
+      if (soldDifference !== 0) {
+        return soldDifference;
+      }
+
+      return productScore(b) - productScore(a);
+    })
     .slice(0, MAX_PRODUCTS)
     .map((product, index) => ({
       ...product,
       position: index + 1
     }));
 
-  await fs.writeFile(
-    DEBUG_RESPONSES_FILE,
-    JSON.stringify(debugResponses, null, 2),
-    'utf8'
-  );
-
-  if (!finalProducts.length) {
+  if (!products.length) {
     console.error(
-      'Không lấy được sản phẩm mới từ trang chủ. ' +
-      'Giữ nguyên products.json cũ.'
+      'Không lấy được sản phẩm mới. Giữ nguyên products.json cũ.'
     );
 
     if (!oldProducts.length) {
       throw new Error(
-        'Lần chạy đầu không lấy được sản phẩm. ' +
-        'Tải artifact shopee-debug để xem trang chủ.'
+        'Không lấy được dữ liệu và chưa có products.json cũ. ' +
+        'Hãy tải artifact debug để kiểm tra daily_discover.json.'
       );
     }
 
@@ -468,21 +538,17 @@ async function main() {
 
   const output = {
     success: true,
-    source: PAGE_URL,
-    source_type: 'homepage_products',
-    count: finalProducts.length,
+    source: SHOPEE_URL,
+    source_type: 'shopee_homepage_api',
+    count: products.length,
     updated_at: new Date().toISOString(),
-    products: finalProducts
+    products
   };
 
-  await fs.writeFile(
-    OUTPUT_FILE,
-    JSON.stringify(output, null, 2),
-    'utf8'
-  );
+  await saveJson(OUTPUT_FILE, output);
 
   console.log(
-    `Đã lưu ${finalProducts.length} sản phẩm từ trang chủ Shopee.`
+    `Hoàn tất: đã lưu ${products.length} sản phẩm vào ${OUTPUT_FILE}`
   );
 }
 
