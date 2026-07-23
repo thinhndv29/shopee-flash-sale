@@ -23,11 +23,10 @@ jobs:
       - name: Lấy mã nguồn
         uses: actions/checkout@v4
 
-      - name: Cài Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: npm
+     - name: Cài Node.js
+  uses: actions/setup-node@v4
+  with:
+    node-version: '20'
 
       - name: Cài thư viện
         run: npm install
